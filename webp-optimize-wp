@@ -1,0 +1,1666 @@
+<?php
+/**
+ * Plugin Name:       WebP Optimizer & Backup
+ * Plugin URI:        
+ * Description:       Automatically converts images to WebP, provides site info, and includes manual website backup/restore functionality.
+ * Version:           3.0.0
+ * Author:            Shehab Ahmed
+ * Author URI:        https://shehab.me
+ * License:           GPL v2 or later
+ * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain:       webp-optimizer
+ * Domain Path:       /languages
+ */
+
+// phpcs:disable WordPress.WP.I18n.TextDomainMismatch
+
+// Exit if accessed directly.
+if ( ! defined( 'ABSPATH' ) ) {
+    exit; 
+}
+
+define( 'SH_WEBP_BACKUP_DIR', __DIR__ . '/backup' );
+define( 'SH_WEBP_PLUGIN_FILE', __FILE__ );
+
+/**
+ * Main Plugin Class
+ */
+final class Shehab_WebP_Converter {
+
+    /** @var Shehab_WebP_Converter The single instance of the class */
+    private static $instance;
+
+    private $version = '3.0.0';
+    private $setting_group = 'sh-webp-settings-group';
+    private $pagespeed_api_key_option = 'sh_webp_pagespeed_api_key';
+    private $xmlrpc_option = 'sh_webp_xmlrpc_setting';
+    private $menu_slug = 'sh_webp_converter';
+    private $pagespeed_transient = 'sh_webp_pagespeed_results';
+    private $stats_transient = 'sh_webp_image_stats';
+    private $db_size_transient = 'sh_webp_db_size';
+
+    /**
+     * Main Instance.
+     */
+    public static function instance() {
+        if ( is_null( self::$instance ) ) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    /**
+     * Constructor.
+     */
+    private function __construct() {
+        // Activation hook for creating backup directory
+        register_activation_hook( SH_WEBP_PLUGIN_FILE, [ $this, 'activate_plugin' ] );
+
+        // Core upload functionality
+        add_filter( 'wp_handle_upload', [ $this, 'handle_upload_conversion' ] );
+
+        // Settings page
+        add_action( 'admin_menu', [ $this, 'add_admin_menu' ] );
+        add_action( 'admin_init', [ $this, 'register_settings' ] );
+        add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_admin_scripts' ] );
+
+        // AJAX handlers
+        add_action( 'wp_ajax_sh_webp_get_unconverted_images', [ $this, 'ajax_get_unconverted_images' ] );
+        add_action( 'wp_ajax_sh_webp_convert_batch', [ $this, 'ajax_convert_batch' ] );
+        add_action( 'wp_ajax_sh_webp_run_response_test', [ $this, 'ajax_run_response_test' ] );
+        add_action( 'wp_ajax_sh_webp_purge_cache', [ $this, 'ajax_purge_cache' ] );
+        add_action( 'wp_ajax_sh_webp_run_pagespeed_test', [ $this, 'ajax_run_pagespeed_test' ] ); 
+        add_action( 'wp_ajax_sh_webp_create_backup', [ $this, 'ajax_create_backup' ] );
+        add_action( 'wp_ajax_sh_webp_restore_backup', [ $this, 'ajax_restore_backup' ] );
+        add_action( 'wp_ajax_sh_webp_delete_backup', [ $this, 'ajax_delete_backup' ] );
+        add_action( 'admin_post_sh_webp_download_backup', [ $this, 'handle_download_backup' ] ); // For download action
+        
+        // Plugin action links
+        add_filter( 'plugin_action_links_' . plugin_basename( SH_WEBP_PLUGIN_FILE ), [ $this, 'add_action_links' ] );
+
+        // Init security features
+        add_action( 'init', [ $this, 'init_security_settings' ] );
+    }
+    
+    /**
+     * Plugin Activation: Create backup directory.
+     */
+    public function activate_plugin() {
+        if ( ! file_exists( SH_WEBP_BACKUP_DIR ) ) {
+            wp_mkdir_p( SH_WEBP_BACKUP_DIR );
+        }
+        // Add .htaccess to prevent direct access
+        $htaccess_content = "Options -Indexes\ndeny from all";
+        $htaccess_file = trailingslashit( SH_WEBP_BACKUP_DIR ) . '.htaccess';
+        if ( ! file_exists( $htaccess_file ) ) {
+             // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_read_file_put_contents
+            @file_put_contents( $htaccess_file, $htaccess_content );
+        }
+    }
+
+    /**
+     * Add "Settings" link to the plugins page.
+     */
+    public function add_action_links( $links ) {
+        $settings_link = '<a href="admin.php?page=' . esc_attr( $this->menu_slug ) . '">' . __( 'Settings', 'webp-optimizer' ) . '</a>';
+        array_unshift( $links, $settings_link );
+        $info_link = '<span style="color: #46b450; font-weight: bold;">' . __( 'Works with LiteSpeed', 'webp-optimizer' ) . '</span>';
+        array_unshift( $links, $info_link );
+        return $links;
+    }
+
+    //======================================================================
+    // 1. CORE UPLOAD CONVERSION (Original Functionality)
+    //======================================================================
+
+    /**
+     * Main function: Hooks into the WordPress upload process.
+     */
+    public function handle_upload_conversion( $file ) {
+        $allowed_types = [ 'image/png', 'image/jpeg' ];
+        if ( ! in_array( $file['type'], $allowed_types, true ) ) {
+            return $file;
+        }
+
+        $webp_file_path = preg_replace( '/\.(png|jpe?g)$/i', '.webp', $file['file'] );
+        $conversion_success = $this->convert_to_webp( $file['file'], $webp_file_path, $file['type'] );
+
+        if ( ! $conversion_success ) {
+            return $file;
+        }
+
+        $webp_stats = @stat( $webp_file_path );
+        $original_stats = @stat( $file['file'] );
+
+        // Only replace if WebP is smaller
+        if ( ! $webp_stats || ! $original_stats || $webp_stats['size'] >= $original_stats['size'] ) {
+            if ( file_exists( $webp_file_path ) ) {
+                wp_delete_file( $webp_file_path ); // Clean up the generated WebP if not used
+            }
+            return $file; // Keep the original
+        }
+
+        // Replace original with WebP
+        wp_delete_file( $file['file'] );
+        $file['file'] = $webp_file_path;
+        $file['url']  = preg_replace( '/\.(png|jpe?g)$/i', '.webp', $file['url'] );
+        $file['type'] = 'image/webp';
+
+        $this->purge_litespeed_cache();
+        
+        // Invalidate stats transient as image counts have changed
+        delete_transient( $this->stats_transient );
+        return $file;
+    }
+
+    /**
+     * Helper function to perform the image conversion using GD or Imagick.
+     */
+    private function convert_to_webp( $source_path, $dest_path, $source_type, $quality = 80 ) {
+        if ( ! file_exists( $source_path ) ) {
+            return false;
+        }
+
+        // Ensure quality is within bounds
+        $quality = max( 1, min( 100, (int) $quality ) );
+
+        // Try Imagick first if available and supports WebP
+        if ( extension_loaded( 'imagick' ) && class_exists( 'Imagick' ) ) {
+            try {
+                $imagick = new \Imagick();
+                // Check if Imagick supports WebP format *before* attempting to load the image
+                if ( ! in_array( 'WEBP', $imagick->queryFormats() ) ) { 
+                    throw new \Exception( 'Imagick does not support WebP format.' );
+                }
+                
+                $imagick->readImage( $source_path ); // Load image *after* format check
+                
+                $imagick->setImageFormat( 'webp' );
+                $imagick->setImageCompressionQuality( $quality );
+                // For PNGs, try to preserve transparency (might slightly increase size)
+                if ( $source_type === 'image/png' ) {
+                   $imagick->setOption('webp:lossless', 'true'); // Experiment with lossless for PNG
+                }
+                $imagick->stripImage(); // Remove metadata like EXIF
+                
+                if ( $imagick->writeImage( $dest_path ) ) {
+                    $imagick->clear();
+                    $imagick->destroy();
+                    return true;
+                } else {
+                     throw new \Exception('Imagick failed to write WebP image.');
+                }
+            } catch ( \Exception $e ) {
+                // Optionally log error: error_log( 'WebP Optimizer Plugin (Imagick Error): ' . $e->getMessage() );
+                // Fall through to GD
+            }
+        }
+
+        // Try GD as a fallback if available and supports WebP
+        if ( extension_loaded( 'gd' ) && function_exists( 'imagewebp' ) ) {
+            try {
+                $image = null;
+                if ( $source_type === 'image/png' && function_exists( 'imagecreatefrompng' ) ) {
+                    $image = @imagecreatefrompng( $source_path );
+                    if ( $image ) {
+                        // Ensure transparency is handled correctly for PNGs
+                        imagepalettetotruecolor( $image ); // Convert indexed color to true color
+                        imagealphablending( $image, false ); // Required for imagesavealpha
+                        imagesavealpha( $image, true ); // Preserve alpha channel
+                    }
+                } elseif ( $source_type === 'image/jpeg' && function_exists( 'imagecreatefromjpeg' ) ) {
+                    $image = @imagecreatefromjpeg( $source_path );
+                }
+
+                if ( ! $image ) {
+                    throw new \Exception( 'GD failed to create image resource from source: ' . $source_path );
+                }
+                
+                // Attempt to save as WebP
+                if ( imagewebp( $image, $dest_path, $quality ) ) {
+                    imagedestroy( $image );
+                    return true;
+                } else {
+                    imagedestroy( $image ); // Clean up resource even if saving failed
+                    throw new \Exception('GD imagewebp() function failed to save image.');
+                }
+            } catch ( \Exception $e ) {
+                // Optionally log error: error_log( 'WebP Optimizer Plugin (GD Error): ' . $e->getMessage() );
+                // Conversion failed with GD as well
+            }
+        }
+
+        // If both methods failed
+        // Optionally log: error_log( 'WebP Optimizer Plugin: All conversion methods failed for ' . $source_path );
+        return false;
+    }
+
+    /**
+     * Clears the LiteSpeed Cache (if active).
+     */
+    private function purge_litespeed_cache() {
+        // Use do_action, it's safe even if LiteSpeed is not active
+        do_action( 'litespeed_purge_all' );
+    }
+
+
+    //======================================================================
+    // 2. SETTINGS PAGE
+    //======================================================================
+
+    /**
+     * Add the admin menu page.
+     */
+    public function add_admin_menu() {
+        add_menu_page(
+            __( 'WebP Optimizer & Backup', 'webp-optimizer' ), // Page Title
+            __( 'WebP Optimizer', 'webp-optimizer' ),      // Menu Title
+            'manage_options',                               // Capability
+            $this->menu_slug,                               // Menu Slug
+            [ $this, 'settings_page_html' ],                // Callback function
+            'dashicons-performance',                        // Icon URL
+            85                                              // Position
+        );
+    }
+
+    /**
+     * Register settings used by the plugin.
+     */
+    public function register_settings() {
+        register_setting( $this->setting_group, $this->pagespeed_api_key_option, 'sanitize_text_field' );
+        register_setting( $this->setting_group, $this->xmlrpc_option, 'sanitize_text_field' );
+    }
+
+    /**
+     * Enqueue necessary scripts and styles for the admin page.
+     */
+    public function enqueue_admin_scripts( $hook_suffix ) {
+        // Only load assets on our plugin's settings page
+        if ( $hook_suffix !== 'toplevel_page_' . $this->menu_slug ) {
+            return;
+        }
+
+        // Register a dummy style handle to attach inline styles
+        wp_register_style( $this->menu_slug . '-style', false, [], $this->version );
+        wp_enqueue_style( $this->menu_slug . '-style' );
+        
+        // Add inline CSS using the WordPress function
+        wp_add_inline_style( $this->menu_slug . '-style', $this->get_admin_css() );
+        
+        // Register a dummy script handle to attach inline scripts and localized data
+        wp_register_script( $this->menu_slug . '-script', false, [ 'jquery' ], $this->version, true ); // Load in footer
+        wp_enqueue_script( $this->menu_slug . '-script' );
+
+        // Pass data from PHP to JavaScript securely
+        wp_localize_script( $this->menu_slug . '-script', 'shWebpData', [
+            'ajaxurl'               => admin_url( 'admin-ajax.php' ),
+            'bulk_nonce'            => wp_create_nonce( 'sh_webp_bulk_nonce' ),
+            'response_nonce'        => wp_create_nonce( 'sh_webp_response_nonce' ),
+            'purge_nonce'           => wp_create_nonce( 'sh_webp_purge_nonce' ),
+            'pagespeed_nonce'       => wp_create_nonce( 'sh_webp_pagespeed_nonce' ),
+            'backup_nonce'          => wp_create_nonce( 'sh_webp_backup_nonce' ),
+            'restore_nonce'         => wp_create_nonce( 'sh_webp_restore_nonce' ),
+            'delete_nonce'          => wp_create_nonce( 'sh_webp_delete_nonce' ),
+            'text_confirm_bulk'     => esc_html__( 'This will convert all existing PNG/JPG images to WebP where smaller. This action cannot be undone. Are you sure?', 'webp-optimizer' ),
+            'text_fetching'         => esc_html__( 'Fetching image list...', 'webp-optimizer' ),
+            'text_found_start'      => esc_html__( 'Found', 'webp-optimizer' ),
+            'text_found_end'        => esc_html__( 'images. Starting conversion...', 'webp-optimizer' ),
+            'text_no_images'        => esc_html__( 'No unconverted PNG or JPG images found.', 'webp-optimizer' ),
+            'text_error_fetch'      => esc_html__( 'Error fetching image list:', 'webp-optimizer' ),
+            'text_complete'         => esc_html__( 'Bulk conversion complete! Processed', 'webp-optimizer' ),
+            'text_complete_end'     => esc_html__( 'images.', 'webp-optimizer' ),
+            'text_processing'       => esc_html__( 'Processing...', 'webp-optimizer' ),
+            'text_converted'        => esc_html__( 'images converted.', 'webp-optimizer' ),
+            'text_error_batch'      => esc_html__( 'Error during batch conversion.', 'webp-optimizer' ),
+            'text_error_generic'    => esc_html__( 'Error:', 'webp-optimizer' ),
+            'text_testing'          => esc_html__( 'Testing...', 'webp-optimizer' ),
+            'text_error'            => esc_html__( 'Error', 'webp-optimizer' ),
+            'text_purging'          => esc_html__( 'Purging...', 'webp-optimizer' ),
+            'text_pagespeed_run'    => esc_html__( 'Running test... This may take a minute.', 'webp-optimizer' ),
+            'text_pagespeed_key'    => esc_html__( 'Please save a PageSpeed API key first.', 'webp-optimizer' ),
+            'text_pagespeed_err'    => esc_html__( 'Error running PageSpeed test:', 'webp-optimizer' ),
+            'text_mobile_score'     => esc_html__( 'Mobile Performance Score', 'webp-optimizer' ),
+            'text_fcp'              => esc_html__( 'First Contentful Paint:', 'webp-optimizer' ),
+            'text_lcp'              => esc_html__( 'Largest Contentful Paint:', 'webp-optimizer' ),
+            'text_tbt'              => esc_html__( 'Total Blocking Time:', 'webp-optimizer' ),
+            'text_cls'              => esc_html__( 'Cumulative Layout Shift:', 'webp-optimizer' ),
+            'text_test_complete'    => esc_html__( 'Test complete!', 'webp-optimizer' ),
+            'text_backup_confirm'   => esc_html__( 'Create a full website backup now? This might take a while.', 'webp-optimizer' ),
+            'text_backup_starting'  => esc_html__( 'Starting backup... Checking disk space...', 'webp-optimizer' ),
+            'text_backup_creating'  => esc_html__( 'Creating archive... Please wait.', 'webp-optimizer' ),
+            'text_backup_complete'  => esc_html__( 'Backup complete!', 'webp-optimizer' ),
+            'text_backup_failed'    => esc_html__( 'Backup failed:', 'webp-optimizer' ),
+            'text_restore_confirm'  => esc_html__( "DANGER! Restoring will OVERWRITE your current website files with the contents of this backup. This CANNOT be undone. Are you absolutely sure?", 'webp-optimizer' ),
+            'text_restore_starting' => esc_html__( 'Starting restore...', 'webp-optimizer' ),
+            'text_restore_extract'  => esc_html__( 'Extracting files... This might take a while. Do not close this page.', 'webp-optimizer' ),
+            'text_restore_complete' => esc_html__( 'Restore complete! It is recommended to clear your browser cache and check your site immediately.', 'webp-optimizer' ),
+            'text_restore_failed'   => esc_html__( 'Restore failed:', 'webp-optimizer' ),
+            'text_delete_confirm'   => esc_html__( 'Are you sure you want to delete this backup file permanently?', 'webp-optimizer' ),
+            'text_deleting'         => esc_html__( 'Deleting...', 'webp-optimizer' ),
+            'text_delete_complete'  => esc_html__( 'Backup deleted.', 'webp-optimizer' ),
+            'text_delete_failed'    => esc_html__( 'Failed to delete backup:', 'webp-optimizer' ),
+            'admin_post_url'        => admin_url( 'admin-post.php' ) // For download links
+        ]);
+
+        // Add inline JavaScript using the WordPress function
+        wp_add_inline_script( $this->menu_slug . '-script', $this->get_admin_js() );
+    }
+
+
+    /**
+     * Render the settings page HTML structure.
+     */
+    public function settings_page_html() {
+        // Get dynamic data for the page
+        $image_stats = $this->get_image_stats();
+        $server_info = $this->get_server_info();
+        $pagespeed_results = get_transient( $this->pagespeed_transient );
+        $backup_files = $this->get_backup_files();
+        ?>
+        <div class="wrap" id="sh-webp-wrap">
+            <h1><?php esc_html_e( 'WebP Optimizer & Backup', 'webp-optimizer' ); ?></h1>
+            <p><?php esc_html_e( 'Configure image conversion, view site statistics, manage backups, and check performance.', 'webp-optimizer' ); ?></p>
+
+            <div class="sh-webp-container">
+                
+                <!-- Main Content Column -->
+                <div class="sh-webp-main">
+
+                    <!-- Site Performance Card -->
+                    <div class="sh-webp-card">
+                        <h2><span class="dashicons dashicons-performance"></span> <?php esc_html_e( 'Site Performance Score', 'webp-optimizer' ); ?></h2>
+                        <p><?php esc_html_e( 'Run a Google PageSpeed Insights test. Requires a free API key.', 'webp-optimizer' ); ?></p>
+                        
+                        <form method="post" action="options.php" id="sh-webp-api-key-form">
+                            <?php settings_fields( $this->setting_group ); ?>
+                            <label for="<?php echo esc_attr( $this->pagespeed_api_key_option ); ?>"><strong><?php esc_html_e( 'PageSpeed API Key:', 'webp-optimizer' ); ?></strong></label>
+                            <input type="text" id="<?php echo esc_attr( $this->pagespeed_api_key_option ); ?>" name="<?php echo esc_attr( $this->pagespeed_api_key_option ); ?>" value="<?php echo esc_attr( get_option( $this->pagespeed_api_key_option ) ); ?>" class="regular-text" placeholder="<?php esc_attr_e( 'Enter your API key', 'webp-optimizer' ); ?>" />
+                            <input type="submit" class="button button-secondary" value="<?php esc_attr_e( 'Save Key', 'webp-optimizer' ); ?>">
+                            <a href="https://developers.google.com/speed/docs/insights/v5/get-started#key" target="_blank" rel="noopener"><?php esc_html_e( 'Get an API Key', 'webp-optimizer' ); ?></a>
+                        </form>
+
+                        <button class="button button-primary" id="sh-webp-pagespeed-start-btn" style="margin-top: 15px;">
+                            <span class="dashicons dashicons-search"></span>
+                            <?php esc_html_e( 'Run PageSpeed Test', 'webp-optimizer' ); ?>
+                        </button>
+                        
+                        <div id="sh-webp-pagespeed-loading" style="display:none; margin-top: 15px;"><?php esc_html_e( 'Running test... This may take a minute.', 'webp-optimizer' ); ?></div>
+                        
+                        <!-- PageSpeed results container -->
+                        <div id="sh-webp-pagespeed-results" class="sh-webp-pagespeed-results-container" <?php echo $pagespeed_results ? '' : 'style="display:none;"'; ?>>
+                            <?php
+                            if ( $pagespeed_results ) {
+                                $this->render_pagespeed_html( $pagespeed_results ); // Render saved results
+                            }
+                            ?>
+                        </div>
+                    </div>
+                    
+                    <!-- Bulk Image Conversion Card -->
+                    <div class="sh-webp-card">
+                        <h2><span class="dashicons dashicons-images-alt2"></span> <?php esc_html_e( 'Bulk Convert Existing Images', 'webp-optimizer' ); ?></h2>
+                        <p><?php esc_html_e( 'Convert existing PNG/JPG images in your Media Library to WebP format where the WebP version is smaller. Runs in batches.', 'webp-optimizer' ); ?></p>
+                        
+                        <div id="sh-webp-bulk-progress-bar-container" style="display:none;">
+                            <div id="sh-webp-bulk-progress-bar"><span></span></div>
+                        </div>
+                        <p id="sh-webp-bulk-status"><?php esc_html_e( 'Ready to start.', 'webp-optimizer' ); ?></p>
+                        <button class="button button-primary sh-webp-button-pulse" id="sh-webp-bulk-start-btn">
+                            <span class="dashicons dashicons-controls-play"></span>
+                            <?php esc_html_e( 'Start Bulk Conversion', 'webp-optimizer' ); ?>
+                        </button>
+                    </div>
+
+                     <!-- Backup & Restore Card -->
+                    <div class="sh-webp-card">
+                        <h2><span class="dashicons dashicons-database"></span> <?php esc_html_e( 'Backup & Restore', 'webp-optimizer' ); ?></h2>
+                        <p><?php esc_html_e( 'Create a full backup (files only) of your WordPress site or restore from a previous backup.', 'webp-optimizer' ); ?></p>
+                        
+                        <button class="button button-primary" id="sh-webp-create-backup-btn">
+                            <span class="dashicons dashicons-archive"></span>
+                            <?php esc_html_e( 'Create Backup Now', 'webp-optimizer' ); ?>
+                        </button>
+                        <p id="sh-webp-backup-status" class="sh-webp-status-message"></p>
+
+                        <h3><?php esc_html_e( 'Available Backups', 'webp-optimizer' ); ?></h3>
+                        <div id="sh-webp-backup-list">
+                            <?php if ( ! empty( $backup_files ) ) : ?>
+                                <ul class="sh-webp-backup-files">
+                                    <?php foreach ( $backup_files as $file ) : ?>
+                                        <li>
+                                            <span class="filename"><?php echo esc_html( $file['name'] ); ?></span>
+                                            <span class="filesize">(<?php echo esc_html( size_format( $file['size'], 2 ) ); ?>)</span>
+                                            <span class="filedate"><?php echo esc_html( date_i18n( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $file['modified'] ) ); ?></span>
+                                            <span class="actions">
+                                                <button class="button button-secondary sh-webp-restore-backup-btn" data-filename="<?php echo esc_attr( $file['name'] ); ?>">
+                                                    <span class="dashicons dashicons-backup"></span> <?php esc_html_e( 'Restore', 'webp-optimizer' ); ?>
+                                                </button>
+                                                <a href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin-post.php?action=sh_webp_download_backup&filename=' . rawurlencode( $file['name'] ) ), 'sh_webp_download_nonce', '_wpnonce' ) ); ?>" class="button button-secondary">
+                                                   <span class="dashicons dashicons-download"></span> <?php esc_html_e( 'Download', 'webp-optimizer' ); ?>
+                                                </a>
+                                                <button class="button button-link-delete sh-webp-delete-backup-btn" data-filename="<?php echo esc_attr( $file['name'] ); ?>">
+                                                    <span class="dashicons dashicons-trash"></span> <?php esc_html_e( 'Delete', 'webp-optimizer' ); ?>
+                                                </button>
+                                            </span>
+                                        </li>
+                                    <?php endforeach; ?>
+                                </ul>
+                            <?php else : ?>
+                                <p><?php esc_html_e( 'No backups found.', 'webp-optimizer' ); ?></p>
+                            <?php endif; ?>
+                        </div>
+                        <p id="sh-webp-restore-status" class="sh-webp-status-message"></p>
+                        <p class="notice notice-error" style="margin-top:15px;"><strong><?php esc_html_e( 'WARNING:', 'webp-optimizer' ); ?></strong> <?php esc_html_e( 'Restoring a backup will overwrite all current website files. This action is irreversible. Use with extreme caution and ensure you have a separate, reliable backup before proceeding.', 'webp-optimizer' ); ?></p>
+                    </div>
+
+                </div>
+
+                <!-- Sidebar Column -->
+                <div class="sh-webp-sidebar">
+
+                    <!-- Server Info Card -->
+                    <div class="sh-webp-card">
+                        <h2><span class="dashicons dashicons-admin-settings"></span> <?php esc_html_e( 'Server Information', 'webp-optimizer' ); ?></h2>
+                        <ul class="sh-webp-info-list">
+                            <li><strong><?php esc_html_e( 'WordPress Version:', 'webp-optimizer' ); ?></strong> <span><?php echo wp_kses_post( $server_info['wp_version'] ); // HTML is intentional ?></span></li>
+                            <li><strong><?php esc_html_e( 'PHP Version:', 'webp-optimizer' ); ?></strong> <span><?php echo wp_kses_post( $server_info['php_version'] ); // HTML is intentional ?></span></li>
+                            <li><strong><?php esc_html_e( 'Server Type:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( $server_info['server_type'] ); ?></span></li>
+                            <li><strong><?php esc_html_e( 'Database Size:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( $server_info['db_size'] ); ?></span></li>
+                            <li><strong><?php esc_html_e( 'Disk Usage (WP Install):', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( $server_info['storage'] ); ?></span></li>
+                            <li><strong><?php esc_html_e( 'Active Plugins:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( $server_info['plugin_count'] ); ?></span></li>
+                            <li>
+                                <strong><?php esc_html_e( 'Server Response (TTFB):', 'webp-optimizer' ); ?></strong> 
+                                <span id="sh-webp-ttfb-result">
+                                    <button class="button button-small" id="sh-webp-run-response-test-btn"><?php esc_html_e( 'Run Test', 'webp-optimizer' ); ?></button>
+                                </span>
+                            </li>
+                        </ul>
+                    </div>
+
+                    <!-- Image Stats Card -->
+                    <div class="sh-webp-card">
+                        <h2><span class="dashicons dashicons-chart-pie"></span> <?php esc_html_e( 'Image Statistics', 'webp-optimizer' ); ?></h2>
+                        <ul class="sh-webp-info-list">
+                            <li><strong><?php esc_html_e( 'Total Images (PNG, JPG, WebP):', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( number_format( $image_stats['total'] ) ); ?></span></li>
+                            <li><strong><?php esc_html_e( 'WebP Images:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( number_format( $image_stats['webp'] ) ); ?></span></li>
+                            <li><strong><?php esc_html_e( 'PNG Images:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( number_format( $image_stats['png'] ) ); ?></span></li>
+                            <li><strong><?php esc_html_e( 'JPG/JPEG Images:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( number_format( $image_stats['jpeg'] ) ); ?></span></li>
+                        </ul>
+                    </div>
+
+                    <!-- Cache Management Card -->
+                    <div class="sh-webp-card">
+                        <h2><span class="dashicons dashicons-controls-fastforward"></span> <?php esc_html_e( 'Cache Management', 'webp-optimizer' ); ?></h2>
+                        <p><?php esc_html_e( 'Clear your website\'s cache. Detects common caching plugins.', 'webp-optimizer' ); ?></p>
+                        <button class="button button-secondary" id="sh-webp-purge-cache-btn">
+                            <span class="dashicons dashicons-trash"></span>
+                            <?php esc_html_e( 'Purge All Caches', 'webp-optimizer' ); ?>
+                        </button>
+                        <p id="sh-webp-purge-cache-status" class="sh-webp-status-message"></p>
+                    </div>
+
+                    <!-- Security Card -->
+                    <div class="sh-webp-card">
+                        <h2><span class="dashicons dashicons-shield-alt"></span> <?php esc_html_e( 'Security', 'webp-optimizer' ); ?></h2>
+                        <form method="post" action="options.php">
+                            <?php settings_fields( $this->setting_group ); ?>
+                            <label for="<?php echo esc_attr( $this->xmlrpc_option ); ?>"><strong><?php esc_html_e( 'XML-RPC:', 'webp-optimizer' ); ?></strong></label>
+                            <p><?php esc_html_e( 'Disabling can enhance security by preventing XML-RPC based attacks.', 'webp-optimizer' ); ?></p>
+                            <select name="<?php echo esc_attr( $this->xmlrpc_option ); ?>" id="<?php echo esc_attr( $this->xmlrpc_option ); ?>">
+                                <option value="enabled" <?php selected( get_option( $this->xmlrpc_option, 'enabled' ), 'enabled' ); ?>><?php esc_html_e( 'Enabled', 'webp-optimizer' ); ?></option>
+                                <option value="disabled" <?php selected( get_option( $this->xmlrpc_option, 'enabled' ), 'disabled' ); ?>><?php esc_html_e( 'Disabled', 'webp-optimizer' ); ?></option>
+                            </select>
+                            <input type="submit" class="button button-secondary" value="<?php esc_attr_e( 'Save', 'webp-optimizer' ); ?>">
+                        </form>
+                    </div>
+
+                </div> <!-- End Sidebar -->
+            </div> <!-- End Container -->
+        </div> <!-- End Wrap -->
+        <?php 
+    }
+
+    /**
+     * Renders the HTML for PageSpeed results.
+     */
+    private function render_pagespeed_html( $data ) {
+        if ( ! $data || isset( $data['error'] ) ) {
+            $error_message = $data['error']['message'] ?? __( 'Unknown PageSpeed API error', 'webp-optimizer' );
+            echo '<p class="sh-webp-status-message error">' . esc_html( $error_message ) . '</p>';
+            return;
+        }
+
+        try {
+            // Safely access potentially nested data
+            $lighthouse = $data['lighthouseResult'] ?? null;
+            $categories = $lighthouse['categories'] ?? null;
+            $performance = $categories['performance'] ?? null;
+            $score = $performance['score'] ?? null;
+            $audits = $lighthouse['audits'] ?? [];
+
+            if ( is_null( $score ) ) {
+                 throw new \Exception( __( 'Performance score not found in API response.', 'webp-optimizer' ) );
+            }
+
+            $performanceScore = round( $score * 100 );
+            $fcp = $audits['first-contentful-paint']['displayValue'] ?? 'N/A';
+            $lcp = $audits['largest-contentful-paint']['displayValue'] ?? 'N/A';
+            $tbt = $audits['total-blocking-time']['displayValue'] ?? 'N/A';
+            $cls = $audits['cumulative-layout-shift']['displayValue'] ?? 'N/A';
+
+            // Determine score class based on performance score
+            $scoreClass = 'sh-webp-score-bad'; // Default to bad
+            if ( $performanceScore >= 90 ) {
+                $scoreClass = 'sh-webp-score-good'; // Good (Green)
+            } elseif ( $performanceScore >= 50 ) {
+                $scoreClass = 'sh-webp-score-ok'; // OK (Yellow)
+            }
+            ?>
+            <div class="sh-webp-score-circle <?php echo esc_attr( $scoreClass ); ?>"><?php echo (int) $performanceScore; ?></div>
+            <strong><?php esc_html_e( 'Mobile Performance Score', 'webp-optimizer' ); ?></strong>
+            <ul>
+                <li><strong><?php esc_html_e( 'First Contentful Paint:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( $fcp ); ?></span></li>
+                <li><strong><?php esc_html_e( 'Largest Contentful Paint:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( $lcp ); ?></span></li>
+                <li><strong><?php esc_html_e( 'Total Blocking Time:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( $tbt ); ?></span></li>
+                <li><strong><?php esc_html_e( 'Cumulative Layout Shift:', 'webp-optimizer' ); ?></strong> <span><?php echo esc_html( $cls ); ?></span></li>
+            </ul>
+            <p class="sh-webp-status-message success"><?php esc_html_e( 'Test complete!', 'webp-optimizer' ); ?></p>
+            <?php
+        } catch ( \Exception $e ) {
+            // Display error message if data structure is unexpected
+            echo '<p class="sh-webp-status-message error">' . esc_html__( 'Error parsing PageSpeed results:', 'webp-optimizer' ) . ' ' . esc_html( $e->getMessage() ) . '</p>';
+        }
+    }
+
+    /**
+     * Get the inline CSS styles for the settings page.
+     * @return string CSS styles.
+     */
+    private function get_admin_css() {
+        ob_start();
+        ?>
+        /* General Layout */
+        #sh-webp-wrap h1 { font-weight: 600; margin-bottom: 15px; }
+        #sh-webp-wrap .sh-webp-container { display: flex; flex-wrap: wrap; gap: 20px; margin-top: 10px; }
+        #sh-webp-wrap .sh-webp-main { flex: 2; min-width: 400px; }
+        #sh-webp-wrap .sh-webp-sidebar { flex: 1; min-width: 300px; }
+
+        /* Card Styles */
+        #sh-webp-wrap .sh-webp-card { background: #fff; border: 1px solid #ccd0d4; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 1px rgba(0,0,0,.04); border-radius: 4px; }
+        #sh-webp-wrap .sh-webp-card h2 { margin-top: 0; padding-bottom: 12px; border-bottom: 1px solid #eee; display: flex; align-items: center; font-size: 1.1em; font-weight: 600; }
+        #sh-webp-wrap .sh-webp-card h2 .dashicons { margin-right: 8px; color: #50575e; }
+        #sh-webp-wrap .sh-webp-card p { font-size: 14px; color: #50575e; margin-bottom: 15px; }
+        #sh-webp-wrap .sh-webp-card label { font-weight: 600; margin-bottom: 5px; display: block; }
+        #sh-webp-wrap .sh-webp-card .regular-text { width: 100%; max-width: 400px; }
+
+        /* Info List (Sidebar) */
+        #sh-webp-wrap .sh-webp-info-list { list-style: none; margin: 0; padding: 0; }
+        #sh-webp-wrap .sh-webp-info-list li { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #f0f0f0; font-size: 14px; }
+        #sh-webp-wrap .sh-webp-info-list li:last-child { border-bottom: none; }
+        #sh-webp-wrap .sh-webp-info-list span { color: #1d2327; text-align: right; }
+        #sh-webp-wrap .sh-webp-info-list span strong { font-weight: 600; }
+        #sh-webp-wrap .sh-webp-info-list span .button-small { font-weight: normal; padding: 0 8px; height: 28px; line-height: 26px; vertical-align: middle;}
+
+        /* Progress Bar */
+        #sh-webp-bulk-progress-bar-container { background: #e0e0e0; border-radius: 4px; height: 20px; width: 100%; overflow: hidden; margin: 15px 0; border: 1px solid #c8c8c8; }
+        #sh-webp-bulk-progress-bar { background: #007cba; height: 100%; width: 0%; transition: width 0.3s ease; display: block; border-radius: 4px 0 0 4px; position: relative; overflow: hidden; }
+        #sh-webp-bulk-progress-bar span { /* Animated stripes */ content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background-image: linear-gradient(-45deg, rgba(255, 255, 255, .15) 25%, transparent 25%, transparent 50%, rgba(255, 255, 255, .15) 50%, rgba(255, 255, 255, .15) 75%, transparent 75%, transparent); background-size: 20px 20px; animation: sh-webp-progress-anim 1s linear infinite; opacity: 0; transition: opacity 0.3s; }
+        #sh-webp-bulk-progress-bar.processing span { opacity: 1; }
+        @keyframes sh-webp-progress-anim { 0% { background-position: 20px 0; } 100% { background-position: 0 0; } }
+
+        /* Status Messages */
+        .sh-webp-status-message { color: #50575e; font-style: italic; margin: 10px 0 0 0; min-height: 1.5em; padding: 5px; border-radius: 3px; }
+        .sh-webp-status-message.success { color: #006400; background-color: #f0fff0; border-left: 3px solid #28a745; font-weight: 600; }
+        .sh-webp-status-message.error { color: #a94442; background-color: #f2dede; border-left: 3px solid #dc3545; font-weight: 600; }
+
+        /* Button Styles */
+        #sh-webp-wrap .button { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; padding: 6px 12px; border-radius: 3px; vertical-align: middle; }
+        #sh-webp-wrap .button .dashicons { font-size: 16px; width: 16px; height: 16px; }
+        #sh-webp-wrap .button-primary:not(:disabled) { background: #2271b1; border-color: #2271b1; }
+        #sh-webp-wrap .button-primary:hover:not(:disabled) { background: #135e96; border-color: #135e96; }
+        #sh-webp-wrap .button:disabled { cursor: not-allowed; }
+        .sh-webp-button-pulse:not(:disabled) { animation: sh-webp-pulse 1.8s infinite; }
+        @keyframes sh-webp-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(34, 113, 177, 0.4); } 70% { box-shadow: 0 0 0 5px rgba(34, 113, 177, 0); } }
+        
+        /* PageSpeed Styles */
+        #sh-webp-api-key-form { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 15px; }
+        #sh-webp-pagespeed-results-container { margin-top: 20px; padding: 15px; background: #fdfdfd; border: 1px solid #eee; border-radius: 4px; }
+        #sh-webp-pagespeed-results .sh-webp-score-circle { width: 70px; height: 70px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 600; color: #fff; margin: 0 auto 15px auto; }
+        .sh-webp-score-good { background: #28a745; } /* Green */
+        .sh-webp-score-ok { background: #ffc107; color:#333 !important; } /* Yellow */
+        .sh-webp-score-bad { background: #dc3545; } /* Red */
+        #sh-webp-pagespeed-results ul { list-style: none; padding: 0; margin: 10px 0 0 0; }
+        #sh-webp-pagespeed-results li { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+
+        /* Backup List Styles */
+        #sh-webp-backup-list { margin-top: 15px; }
+        .sh-webp-backup-files { list-style: none; margin: 0; padding: 0; border: 1px solid #ddd; border-radius: 3px; }
+        .sh-webp-backup-files li { display: flex; flex-wrap: wrap; align-items: center; padding: 10px 15px; border-bottom: 1px solid #eee; gap: 10px; }
+        .sh-webp-backup-files li:last-child { border-bottom: none; }
+        .sh-webp-backup-files .filename { font-weight: 600; flex-basis: 100%; margin-bottom: 5px; word-break: break-all; }
+        .sh-webp-backup-files .filesize, .sh-webp-backup-files .filedate { color: #666; font-size: 12px; margin-right: 15px; }
+        .sh-webp-backup-files .actions { margin-left: auto; display: flex; gap: 5px; flex-wrap: wrap; }
+        .sh-webp-backup-files .button-link-delete { color: #dc3545 !important; }
+        .sh-webp-backup-files .button-link-delete:hover { color: #a71b2a !important; }
+        
+        @media (max-width: 782px) { /* Adjust for smaller screens */
+            #sh-webp-wrap .sh-webp-container { flex-direction: column; }
+            #sh-webp-wrap .sh-webp-sidebar { width: 100%; }
+            .sh-webp-backup-files .actions { margin-left: 0; flex-basis: 100%; margin-top: 5px; }
+        }
+        <?php
+        return ob_get_clean();
+    }
+    
+    /**
+     * Get the inline JavaScript for the settings page.
+     * @return string JS code.
+     */
+    private function get_admin_js() {
+        ob_start();
+        ?>
+        jQuery(document).ready(function($) {
+            
+            // --- Bulk Image Converter ---
+            const $bulkStartBtn = $('#sh-webp-bulk-start-btn');
+            const $bulkProgressBar = $('#sh-webp-bulk-progress-bar');
+            const $bulkProgressBarContainer = $('#sh-webp-bulk-progress-bar-container');
+            const $bulkStatus = $('#sh-webp-bulk-status');
+            let imageQueue = [];
+            let totalImages = 0;
+            let processedImages = 0;
+            const batchSize = 10; // Process 10 images at a time
+
+            $bulkStartBtn.on('click', function() {
+                if (!confirm(shWebpData.text_confirm_bulk)) return;
+
+                $bulkStartBtn.prop('disabled', true).removeClass('sh-webp-button-pulse');
+                $bulkStatus.text(shWebpData.text_fetching).removeClass('success error');
+                $bulkProgressBarContainer.show();
+                $bulkProgressBar.css('width', '0%').removeClass('processing');
+
+                $.post(shWebpData.ajaxurl, {
+                    action: 'sh_webp_get_unconverted_images',
+                    nonce: shWebpData.bulk_nonce
+                })
+                .done(function(response) {
+                    if (response.success && response.data.length > 0) {
+                        imageQueue = response.data;
+                        totalImages = imageQueue.length;
+                        processedImages = 0;
+                        $bulkStatus.text(shWebpData.text_found_start + ' ' + totalImages + ' ' + shWebpData.text_found_end);
+                        $bulkProgressBar.addClass('processing');
+                        updateBulkProgressBar();
+                        processImageBatch(); // Start processing the first batch
+                    } else {
+                        $bulkStatus.text(shWebpData.text_no_images);
+                        $bulkStartBtn.prop('disabled', false).addClass('sh-webp-button-pulse');
+                        $bulkProgressBarContainer.hide();
+                    }
+                })
+                .fail(function(jqXHR) {
+                    $bulkStatus.text(shWebpData.text_error_fetch + ' ' + jqXHR.statusText).addClass('error');
+                    $bulkStartBtn.prop('disabled', false).addClass('sh-webp-button-pulse');
+                    $bulkProgressBarContainer.hide();
+                });
+            });
+
+            function processImageBatch() {
+                if (imageQueue.length === 0) {
+                    $bulkStatus.text(shWebpData.text_complete + ' ' + totalImages + ' ' + shWebpData.text_complete_end).addClass('success');
+                    $bulkStartBtn.prop('disabled', false).addClass('sh-webp-button-pulse');
+                    $bulkProgressBar.css('width', '100%').removeClass('processing');
+                    setTimeout(() => location.reload(), 2500); // Reload page to update stats
+                    return;
+                }
+
+                const batch = imageQueue.splice(0, batchSize);
+                
+                $.post(shWebpData.ajaxurl, {
+                    action: 'sh_webp_convert_batch',
+                    nonce: shWebpData.bulk_nonce,
+                    ids: batch.join(',') // Send IDs as comma-separated string
+                })
+                .done(function(response) {
+                    if (response.success) {
+                        processedImages += batch.length; // Assume all in batch were attempted
+                        // Adjust processed count based on actual conversions if needed, e.g., using response.data.converted
+                        $bulkStatus.text(shWebpData.text_processing + ' ' + processedImages + ' / ' + totalImages + ' ' + shWebpData.text_converted);
+                        updateBulkProgressBar();
+                        setTimeout(processImageBatch, 100); // Small delay before next batch
+                    } else {
+                        throw new Error(response.data.message || shWebpData.text_error_batch);
+                    }
+                })
+                .fail(function(jqXHR, textStatus, errorThrown) {
+                    let errorMsg = errorThrown || jqXHR.statusText;
+                    $bulkStatus.text(shWebpData.text_error_generic + ' ' + errorMsg).addClass('error');
+                    $bulkStartBtn.prop('disabled', false).addClass('sh-webp-button-pulse');
+                    $bulkProgressBar.removeClass('processing');
+                });
+            }
+
+            function updateBulkProgressBar() {
+                const percentage = totalImages > 0 ? (processedImages / totalImages) * 100 : 0;
+                $bulkProgressBar.css('width', percentage + '%');
+            }
+
+            // --- Server Response Test ---
+            const $ttfbBtn = $('#sh-webp-run-response-test-btn');
+            const $ttfbResult = $('#sh-webp-ttfb-result');
+            $ttfbBtn.on('click', function() {
+                $ttfbBtn.prop('disabled', true);
+                $ttfbResult.html(shWebpData.text_testing);
+                
+                $.post(shWebpData.ajaxurl, {
+                    action: 'sh_webp_run_response_test',
+                    nonce: shWebpData.response_nonce
+                })
+                .done(function(response) {
+                    if (response.success) {
+                        let time = response.data.time_ms;
+                        let color = time < 300 ? 'green' : (time < 600 ? 'orange' : 'red');
+                        $ttfbResult.html(`<strong style="color:${color};">${time} ms</strong>`);
+                    } else {
+                        $ttfbResult.text(shWebpData.text_error);
+                    }
+                })
+                .fail(function() {
+                     $ttfbResult.text(shWebpData.text_error);
+                })
+                .always(function() {
+                    $ttfbBtn.prop('disabled', false);
+                });
+            });
+
+            // --- Purge Cache ---
+            const $purgeBtn = $('#sh-webp-purge-cache-btn');
+            const $purgeStatus = $('#sh-webp-purge-cache-status');
+            $purgeBtn.on('click', function() {
+                $purgeBtn.prop('disabled', true);
+                $purgeStatus.text(shWebpData.text_purging).removeClass('success error');
+                
+                $.post(shWebpData.ajaxurl, {
+                    action: 'sh_webp_purge_cache',
+                    nonce: shWebpData.purge_nonce
+                })
+                .done(function(response) {
+                    $purgeStatus.text(response.data.message).addClass(response.success ? 'success' : 'error');
+                })
+                .fail(function() {
+                    $purgeStatus.text(shWebpData.text_error).addClass('error');
+                })
+                .always(function() {
+                    $purgeBtn.prop('disabled', false);
+                });
+            });
+
+            // --- PageSpeed Test ---
+            const $pagespeedBtn = $('#sh-webp-pagespeed-start-btn');
+            const $pagespeedApiInput = $('#<?php echo esc_js( $this->pagespeed_api_key_option ); ?>');
+            const $pagespeedLoading = $('#sh-webp-pagespeed-loading');
+            const $pagespeedResults = $('#sh-webp-pagespeed-results');
+
+            $pagespeedBtn.on('click', function() {
+                const apiKey = $pagespeedApiInput.val().trim();
+                if (!apiKey) {
+                    alert(shWebpData.text_pagespeed_key);
+                    return;
+                }
+
+                $pagespeedBtn.prop('disabled', true);
+                $pagespeedLoading.show();
+                $pagespeedResults.hide().empty(); // Hide and clear previous results
+
+                $.post(shWebpData.ajaxurl, {
+                    action: 'sh_webp_run_pagespeed_test',
+                    nonce: shWebpData.pagespeed_nonce
+                    // API key is read server-side from options
+                })
+                .done(function(response) {
+                    if (response.success && response.data.html) {
+                        $pagespeedResults.html(response.data.html).show();
+                    } else {
+                        // Handle errors reported successfully via JSON
+                        let errorMsg = response.data.message || shWebpData.text_unknown_error;
+                        $pagespeedResults.html(`<p class="sh-webp-status-message error">${shWebpData.text_pagespeed_err} ${errorMsg}</p>`).show();
+                    }
+                })
+                .fail(function(jqXHR) {
+                    // Handle AJAX communication errors
+                    let errorMsg = jqXHR.responseJSON?.data?.message || jqXHR.statusText || shWebpData.text_unknown_error;
+                     $pagespeedResults.html(`<p class="sh-webp-status-message error">${shWebpData.text_pagespeed_err} ${errorMsg}</p>`).show();
+                })
+                .always(function() {
+                    $pagespeedBtn.prop('disabled', false);
+                    $pagespeedLoading.hide();
+                });
+            });
+
+            // --- Create Backup ---
+            const $createBackupBtn = $('#sh-webp-create-backup-btn');
+            const $backupStatus = $('#sh-webp-backup-status');
+
+            $createBackupBtn.on('click', function() {
+                if (!confirm(shWebpData.text_backup_confirm)) return;
+
+                $createBackupBtn.prop('disabled', true);
+                $backupStatus.text(shWebpData.text_backup_starting).removeClass('success error');
+
+                $.post(shWebpData.ajaxurl, {
+                    action: 'sh_webp_create_backup',
+                    nonce: shWebpData.backup_nonce
+                })
+                .done(function(response) {
+                    if (response.success) {
+                        $backupStatus.text(response.data.message).addClass('success');
+                        setTimeout(() => location.reload(), 2000); // Reload to show new backup in list
+                    } else {
+                        $backupStatus.text(shWebpData.text_backup_failed + ' ' + response.data.message).addClass('error');
+                         $createBackupBtn.prop('disabled', false);
+                    }
+                })
+                .fail(function(jqXHR) {
+                     $backupStatus.text(shWebpData.text_backup_failed + ' ' + jqXHR.statusText).addClass('error');
+                     $createBackupBtn.prop('disabled', false);
+                });
+            });
+
+            // --- Restore Backup ---
+            const $restoreStatus = $('#sh-webp-restore-status');
+            $('#sh-webp-backup-list').on('click', '.sh-webp-restore-backup-btn', function() {
+                const $button = $(this);
+                const filename = $button.data('filename');
+                
+                if (!confirm(shWebpData.text_restore_confirm)) return;
+                // Add a second, more dire warning maybe?
+                // if (!confirm("SECOND WARNING: This will overwrite EVERYTHING. Are you 100% sure?")) return;
+
+                $button.prop('disabled', true);
+                $('.sh-webp-restore-backup-btn, #sh-webp-create-backup-btn, .sh-webp-delete-backup-btn').prop('disabled', true); // Disable all backup actions
+                $restoreStatus.text(shWebpData.text_restore_starting).removeClass('success error');
+
+                $.post(shWebpData.ajaxurl, {
+                    action: 'sh_webp_restore_backup',
+                    nonce: shWebpData.restore_nonce,
+                    filename: filename
+                })
+                .done(function(response) {
+                    if (response.success) {
+                        $restoreStatus.text(response.data.message).addClass('success');
+                         // Maybe redirect or just show message? Reloading might be confusing.
+                         // alert(shWebpData.text_restore_complete); // Alert might be better as page might change
+                    } else {
+                         $restoreStatus.text(shWebpData.text_restore_failed + ' ' + response.data.message).addClass('error');
+                    }
+                })
+                .fail(function(jqXHR) {
+                     $restoreStatus.text(shWebpData.text_restore_failed + ' ' + jqXHR.statusText).addClass('error');
+                })
+                .always(function() {
+                     // Re-enable buttons cautiously, maybe only after a delay or success?
+                     // For now, leave them disabled after an attempt, requiring page reload.
+                     // $button.prop('disabled', false); 
+                });
+            });
+
+            // --- Delete Backup ---
+             $('#sh-webp-backup-list').on('click', '.sh-webp-delete-backup-btn', function() {
+                const $button = $(this);
+                const filename = $button.data('filename');
+                const $listItem = $button.closest('li');
+
+                if (!confirm(shWebpData.text_delete_confirm)) return;
+
+                $button.prop('disabled', true);
+                $listItem.css('opacity', '0.5'); // Visually indicate deletion
+                // Consider adding a specific status message area for delete if needed
+
+                $.post(shWebpData.ajaxurl, {
+                    action: 'sh_webp_delete_backup',
+                    nonce: shWebpData.delete_nonce,
+                    filename: filename
+                })
+                .done(function(response) {
+                    if (response.success) {
+                        $listItem.fadeOut(300, function() { $(this).remove(); });
+                         // Optionally show a success message briefly
+                         // $restoreStatus.text(shWebpData.text_delete_complete).addClass('success').delay(2000).fadeOut();
+                    } else {
+                         alert(shWebpData.text_delete_failed + ' ' + response.data.message);
+                         $button.prop('disabled', false);
+                         $listItem.css('opacity', '1');
+                    }
+                })
+                .fail(function(jqXHR) {
+                    alert(shWebpData.text_delete_failed + ' ' + jqXHR.statusText);
+                    $button.prop('disabled', false);
+                    $listItem.css('opacity', '1');
+                });
+            });
+
+        });
+        <?php
+        return ob_get_clean();
+    }
+
+    //======================================================================
+    // 3. AJAX HANDLERS
+    //======================================================================
+
+    /**
+     * AJAX: Get list of unconverted PNG/JPG image attachment IDs.
+     */
+    public function ajax_get_unconverted_images() {
+        check_ajax_referer( 'sh_webp_bulk_nonce', 'nonce' );
+        if ( ! current_user_can( 'upload_files' ) ) { // Capability check: Can user upload files?
+            wp_send_json_error( [ 'message' => esc_html__( 'Permission denied.', 'webp-optimizer' ) ] );
+        }
+
+        // Optimized query to get only IDs of relevant mime types
+        $query = new \WP_Query([
+            'post_type'      => 'attachment',
+            'post_status'    => 'inherit',
+            'post_mime_type' => [ 'image/jpeg', 'image/png' ],
+            'posts_per_page' => -1, // Get all
+            'fields'         => 'ids', // Only fetch IDs
+            'no_found_rows'  => true, // Skip pagination calculation
+            'update_post_meta_cache' => false, // Don't need meta
+            'update_post_term_cache' => false, // Don't need terms
+        ]);
+
+        wp_send_json_success( $query->posts );
+    }
+
+    /**
+     * AJAX: Convert a batch of image IDs to WebP.
+     */
+    public function ajax_convert_batch() {
+        check_ajax_referer( 'sh_webp_bulk_nonce', 'nonce' );
+        if ( ! current_user_can( 'upload_files' ) ) { // Use same capability as getting IDs
+            wp_send_json_error( [ 'message' => esc_html__( 'Permission denied.', 'webp-optimizer' ) ] );
+        }
+
+        // Sanitize the input string of IDs
+        $ids_raw = isset( $_POST['ids'] ) ? sanitize_text_field( wp_unslash( $_POST['ids'] ) ) : '';
+        $ids = ! empty( $ids_raw ) ? array_map( 'intval', explode( ',', $ids_raw ) ) : [];
+        
+        if ( empty( $ids ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'No image IDs provided.', 'webp-optimizer' ) ] );
+        }
+
+        $converted_count = 0;
+        $failed_ids = [];
+
+        foreach ( $ids as $id ) {
+            $source_path = get_attached_file( $id ); // Get full path to the original file
+
+            // Skip if file doesn't exist or path couldn't be determined
+            if ( ! $source_path || ! file_exists( $source_path ) ) {
+                $failed_ids[] = $id;
+                continue; 
+            }
+
+            $mime_type = get_post_mime_type( $id );
+            // Generate the target WebP path by replacing the extension
+            $webp_path = preg_replace( '/\.(png|jpe?g)$/i', '.webp', $source_path );
+            
+            // Attempt the conversion
+            $success = $this->convert_to_webp( $source_path, $webp_path, $mime_type );
+            if ( ! $success ) {
+                $failed_ids[] = $id;
+                continue; // Skip to next image if conversion failed
+            }
+
+            // Check if the WebP file is actually smaller
+            $webp_stats = @stat( $webp_path );
+            $original_stats = @stat( $source_path );
+            if ( ! $webp_stats || ! $original_stats || $webp_stats['size'] >= $original_stats['size'] ) {
+                @wp_delete_file( $webp_path ); // Delete the larger WebP file
+                // Don't count as failure, just didn't replace
+                continue; // Keep the original, move to next image
+            }
+
+            // --- Success: Replace original with WebP ---
+
+            // 1. Get path relative to uploads directory for database update
+            $upload_dir = wp_get_upload_dir();
+            // Ensure path uses forward slashes for consistency
+            $new_relative_path = str_replace( trailingslashit( $upload_dir['basedir'] ), '', $webp_path ); 
+            $new_relative_path = str_replace( '\\', '/', $new_relative_path); // Normalize slashes
+
+            // 2. Update the attachment post meta to point to the new file path
+            update_attached_file( $id, $new_relative_path );
+
+            // 3. Update the attachment post's mime type
+            wp_update_post( [ 'ID' => $id, 'post_mime_type' => 'image/webp' ] );
+            
+            // 4. Update the attachment metadata (important for WP functions)
+            $metadata = wp_get_attachment_metadata( $id );
+            if ( $metadata ) { // Check if metadata exists
+                 $metadata['file'] = $new_relative_path; 
+                 // We are NOT regenerating thumbnails here, so we don't update 'sizes'.
+                 // We will delete the old thumbnail *files* below.
+                 wp_update_attachment_metadata( $id, $metadata );
+            }
+
+            // 5. Delete the original source file
+            @wp_delete_file( $source_path );
+            
+            // 6. Delete old associated thumbnail FILES (if they exist)
+            // They are still listed in metadata['sizes'], but the files should be removed.
+            if ( isset( $metadata['sizes'] ) && is_array( $metadata['sizes'] ) ) {
+                $path_parts = pathinfo($source_path); // Use original path info
+                foreach ( $metadata['sizes'] as $size_data ) {
+                     if ( isset($size_data['file']) ) {
+                         $original_thumb_path = trailingslashit($path_parts['dirname']) . $size_data['file'];
+                         @wp_delete_file( $original_thumb_path );
+                     }
+                }
+            }
+            
+            $converted_count++;
+        } // End foreach loop
+
+        // Purge cache and invalidate stats transient only if something was converted
+        if ( $converted_count > 0 ) {
+            $this->purge_litespeed_cache();
+            delete_transient( $this->stats_transient );
+        }
+
+        // Send success response with counts
+        wp_send_json_success( [ 
+            'converted' => $converted_count, 
+            'total_in_batch' => count($ids),
+            'failed_ids' => $failed_ids // Optionally return IDs that failed
+        ] );
+    }
+
+
+    /**
+     * AJAX: Handle Server Response Time (TTFB) Test.
+     */
+    public function ajax_run_response_test() {
+        check_ajax_referer( 'sh_webp_response_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Permission denied.', 'webp-optimizer' ) ] );
+        }
+        
+        $start_time = microtime( true );
+        // Make a HEAD request for potentially faster response, fallback to GET
+        $response = wp_remote_request( home_url(), [ 'method' => 'HEAD', 'timeout' => 10 ] );
+        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) >= 400 ) {
+             $response = wp_remote_get( home_url(), [ 'timeout' => 10 ] ); // Fallback to GET
+        }
+        $end_time = microtime( true );
+
+        if ( is_wp_error( $response ) ) {
+            wp_send_json_error( [ 'message' => $response->get_error_message() ] );
+        }
+
+        $time_ms = round( ( $end_time - $start_time ) * 1000 );
+        wp_send_json_success( [ 'time_ms' => $time_ms ] );
+    }
+
+    /**
+     * AJAX: Handle Purging Caches from known plugins.
+     */
+    public function ajax_purge_cache() {
+        check_ajax_referer( 'sh_webp_purge_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Permission denied.', 'webp-optimizer' ) ] );
+        }
+        
+        $purged_plugins = [];
+
+        // LiteSpeed Cache
+        if ( class_exists( 'LiteSpeed_Cache_API' ) ) {
+            LiteSpeed_Cache_API::purge_all();
+            $purged_plugins[] = 'LiteSpeed Cache';
+        } elseif ( has_action( 'litespeed_purge_all' ) ) { // Also check for action hook
+            do_action( 'litespeed_purge_all' );
+            $purged_plugins[] = 'LiteSpeed Cache (via action)';
+        }
+
+        // WP Rocket
+        if ( function_exists( 'rocket_clean_domain' ) ) {
+            rocket_clean_domain();
+            // Purge Cloudflare cache if WP Rocket integration is active
+            if ( function_exists( 'rocket_clean_cloudflare' ) ) {
+                 rocket_clean_cloudflare();
+            }
+             $purged_plugins[] = 'WP Rocket';
+        }
+
+        // W3 Total Cache
+        if ( function_exists( 'w3tc_flush_all' ) ) {
+            w3tc_flush_all();
+            $purged_plugins[] = 'W3 Total Cache';
+        }
+        
+        // Add more cache plugins here if needed (e.g., WP Super Cache, WP Optimize)
+        // Example for WP Super Cache:
+        // if ( function_exists( 'wp_cache_clear_cache' ) ) {
+        //    wp_cache_clear_cache();
+        //    $purged_plugins[] = 'WP Super Cache';
+        // }
+
+
+        if ( ! empty( $purged_plugins ) ) {
+            wp_send_json_success( [ 
+                'message' => sprintf( 
+                    /* translators: %s: Comma-separated list of purged cache plugin names. */
+                    esc_html__( 'Caches purged successfully for: %s', 'webp-optimizer' ), 
+                    implode( ', ', $purged_plugins ) 
+                ) 
+            ] );
+        } else {
+            wp_send_json_error( [ 'message' => esc_html__( 'No active/supported cache plugin detected or purge failed.', 'webp-optimizer' ) ] );
+        }
+    }
+
+    /**
+     * AJAX: Handle Google PageSpeed Insights Test.
+     */
+    public function ajax_run_pagespeed_test() {
+        check_ajax_referer( 'sh_webp_pagespeed_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Permission denied.', 'webp-optimizer' ) ] );
+        }
+        
+        $api_key = get_option( $this->pagespeed_api_key_option );
+        if ( empty( $api_key ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'PageSpeed API key is missing. Please save it in the settings.', 'webp-optimizer' ) ] );
+        }
+
+        $site_url = home_url();
+        // Construct the API URL
+        $api_url = add_query_arg( [
+            'url' => urlencode( $site_url ),
+            'key' => $api_key,
+            'strategy' => 'MOBILE', // Focus on mobile results
+            // Add categories if needed, e.g., 'category' => ['PERFORMANCE', 'ACCESSIBILITY']
+        ], 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed' );
+        
+        // Make the API request
+        $response = wp_remote_get( $api_url, [ 'timeout' => 60 ] ); // Increase timeout
+
+        if ( is_wp_error( $response ) ) {
+            wp_send_json_error( [ 'message' => $response->get_error_message() ] );
+        }
+
+        $response_code = wp_remote_retrieve_response_code( $response );
+        $body = wp_remote_retrieve_body( $response );
+        $data = json_decode( $body, true );
+
+        // Check for API errors or invalid response code
+        if ( $response_code >= 400 || ! $data || isset( $data['error'] ) ) {
+            $error_message = __( 'Unknown API error', 'webp-optimizer' );
+            if ( isset( $data['error']['message'] ) ) {
+                $error_message = $data['error']['message'];
+            } elseif ( $response_code >= 400 ) {
+                 $error_message = sprintf( __( 'API returned status code %d', 'webp-optimizer' ), $response_code );
+            }
+            wp_send_json_error( [ 'message' => $error_message ] );
+        }
+
+        // Save successful results to a transient for 24 hours
+        set_transient( $this->pagespeed_transient, $data, DAY_IN_SECONDS );
+        
+        // Generate the HTML output for the results
+        ob_start();
+        $this->render_pagespeed_html( $data );
+        $html = ob_get_clean();
+
+        // Send the HTML back in the success response
+        wp_send_json_success( [ 'html' => $html ] );
+    }
+
+    /**
+     * AJAX: Create Website Backup (Files only).
+     */
+    public function ajax_create_backup() {
+        check_ajax_referer( 'sh_webp_backup_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) { // Requires high privileges
+            wp_send_json_error( [ 'message' => esc_html__( 'Permission denied.', 'webp-optimizer' ) ] );
+        }
+
+        // Increase execution time limits for backup process
+        @set_time_limit( 0 ); 
+        @ini_set( 'memory_limit', '512M' ); // Try to increase memory
+
+        // Check if PharData class exists (required for tar.gz)
+        if ( ! class_exists( 'PharData' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'PHP Phar extension is required for creating backups. Please enable it on your server.', 'webp-optimizer' ) ] );
+        }
+
+        // --- Disk Space Check ---
+        $estimated_size = $this->get_directory_size( ABSPATH );
+        $free_space = @disk_free_space( SH_WEBP_BACKUP_DIR );
+
+        // Add a buffer (e.g., 20%) to the estimated size for safety
+        $required_space = $estimated_size * 1.2; 
+
+        if ( ! $free_space || $free_space < $required_space ) {
+            wp_send_json_error( [ 
+                'message' => sprintf(
+                    /* translators: 1: Required disk space (e.g., 1.2 GB), 2: Available disk space (e.g., 500 MB). */
+                    esc_html__( 'Insufficient disk space. Estimated required: %1$s, Available: %2$s. Please free up space or upgrade your hosting plan.', 'webp-optimizer' ),
+                    size_format( $required_space, 2 ),
+                    $free_space ? size_format( $free_space, 2 ) : 'N/A'
+                )
+            ] );
+        }
+
+        // --- Create Backup ---
+        $backup_filename = 'backup_' . date( 'Y-m-d_H-i-s' ) . '_' . wp_generate_password( 8, false ) . '.tar';
+        $backup_path_tar = trailingslashit( SH_WEBP_BACKUP_DIR ) . $backup_filename;
+        $backup_path_gz = $backup_path_tar . '.gz';
+
+        try {
+            // Ensure backup directory exists (should be created on activation)
+            if ( ! file_exists( SH_WEBP_BACKUP_DIR ) ) {
+                wp_mkdir_p( SH_WEBP_BACKUP_DIR );
+            }
+             // Add .htaccess again just in case
+            $htaccess_content = "Options -Indexes\ndeny from all";
+            $htaccess_file = trailingslashit( SH_WEBP_BACKUP_DIR ) . '.htaccess';
+             // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_read_file_put_contents
+            @file_put_contents( $htaccess_file, $htaccess_content );
+
+
+            // Create TAR archive of the entire WordPress installation directory (ABSPATH)
+            $phar = new PharData( $backup_path_tar );
+            
+            // Build the directory structure recursively
+            // Exclude the backup directory itself and potentially other large/unnecessary files
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator( ABSPATH, RecursiveDirectoryIterator::SKIP_DOTS ),
+                RecursiveIteratorIterator::SELF_FIRST
+            );
+
+            $files_added = 0;
+            foreach ( $iterator as $item ) {
+                // Exclude the backup directory
+                if ( strpos( $item->getPathname(), SH_WEBP_BACKUP_DIR ) === 0 ) {
+                    continue;
+                }
+                // Exclude common cache directories (add more as needed)
+                if ( strpos( $item->getPathname(), WP_CONTENT_DIR . '/cache' ) === 0 ) {
+                     continue;
+                }
+                 if ( strpos( $item->getPathname(), WP_CONTENT_DIR . '/upgrade' ) === 0 ) {
+                     continue;
+                }
+
+                // Add file/directory to archive, preserving path structure relative to ABSPATH
+                $relativePath = str_replace( ABSPATH, '', $item->getPathname() );
+                $phar->addFile( $item->getPathname(), $relativePath );
+                $files_added++;
+            }
+            
+            if ($files_added === 0) {
+                 throw new \Exception( __( 'No files were added to the archive. Check directory permissions.', 'webp-optimizer' ) );
+            }
+
+            // Compress the TAR archive using Gzip
+            $phar->compress( Phar::GZ );
+
+            // Delete the uncompressed TAR file
+            wp_delete_file( $backup_path_tar ); 
+
+            // Check if the compressed file exists
+            if ( ! file_exists( $backup_path_gz ) ) {
+                 throw new \Exception( __( 'Failed to create compressed backup file.', 'webp-optimizer' ) );
+            }
+
+            wp_send_json_success( [ 
+                'message' => sprintf(
+                    /* translators: %s: Filename of the created backup. */
+                    esc_html__( 'Backup created successfully: %s', 'webp-optimizer' ), 
+                    basename( $backup_path_gz ) 
+                )
+            ] );
+
+        } catch ( \Exception $e ) {
+            // Clean up potentially incomplete files
+            if ( file_exists( $backup_path_tar ) ) {
+                wp_delete_file( $backup_path_tar );
+            }
+            if ( file_exists( $backup_path_gz ) ) {
+                wp_delete_file( $backup_path_gz );
+            }
+            wp_send_json_error( [ 'message' => $e->getMessage() ] );
+        }
+    }
+
+    /**
+     * AJAX: Restore Website Backup (Files only). EXTREMELY DANGEROUS.
+     */
+    public function ajax_restore_backup() {
+        check_ajax_referer( 'sh_webp_restore_nonce', 'nonce' );
+        // Use a stricter capability check for restore
+        if ( ! current_user_can( 'install_plugins' ) ) { // Requires ability to modify core files effectively
+            wp_send_json_error( [ 'message' => esc_html__( 'Permission denied. Restore requires administrator privileges.', 'webp-optimizer' ) ] );
+        }
+
+         // Increase execution time limits
+        @set_time_limit( 0 );
+        @ini_set( 'memory_limit', '512M' );
+
+        $filename_raw = isset( $_POST['filename'] ) ? sanitize_file_name( wp_unslash( $_POST['filename'] ) ) : '';
+        if ( empty( $filename_raw ) || ! preg_match( '/^backup_.*\.tar\.gz$/', $filename_raw ) ) {
+             wp_send_json_error( [ 'message' => esc_html__( 'Invalid backup filename provided.', 'webp-optimizer' ) ] );
+        }
+        
+        $backup_path_gz = trailingslashit( SH_WEBP_BACKUP_DIR ) . $filename_raw;
+        $backup_path_tar = str_replace( '.gz', '', $backup_path_gz ); // Path for temporary tar
+
+        // Verify the backup file exists and is within the backup directory
+        if ( ! file_exists( $backup_path_gz ) || strpos( realpath( $backup_path_gz ), realpath( SH_WEBP_BACKUP_DIR ) ) !== 0 ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Backup file not found or invalid path.', 'webp-optimizer' ) ] );
+        }
+         
+        if ( ! class_exists( 'PharData' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'PHP Phar extension is required for restoring backups.', 'webp-optimizer' ) ] );
+        }
+
+        try {
+            // --- Restoration Process ---
+            // 1. Decompress .tar.gz to .tar
+            $phar = new PharData( $backup_path_gz );
+            $phar->decompress(); // Creates the .tar file
+
+            if ( ! file_exists( $backup_path_tar ) ) {
+                throw new \Exception( __( 'Failed to decompress backup file.', 'webp-optimizer' ) );
+            }
+
+            // 2. Extract the .tar archive to ABSPATH, overwriting existing files
+            $phar_tar = new PharData( $backup_path_tar );
+            if ( ! $phar_tar->extractTo( ABSPATH, null, true ) ) { // The third parameter enables overwriting
+                 throw new \Exception( __( 'Failed to extract backup archive. Check file permissions.', 'webp-optimizer' ) );
+            }
+
+            // 3. Clean up the temporary .tar file
+            wp_delete_file( $backup_path_tar );
+
+            wp_send_json_success( [ 'message' => esc_html__( 'Restore completed successfully. Please check your website.', 'webp-optimizer' ) ] );
+
+        } catch ( \Exception $e ) {
+            // Clean up temporary .tar file if it exists
+             if ( file_exists( $backup_path_tar ) ) {
+                wp_delete_file( $backup_path_tar );
+            }
+            wp_send_json_error( [ 'message' => $e->getMessage() ] );
+        }
+    }
+    
+     /**
+     * AJAX: Delete a backup file.
+     */
+    public function ajax_delete_backup() {
+        check_ajax_referer( 'sh_webp_delete_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( [ 'message' => esc_html__( 'Permission denied.', 'webp-optimizer' ) ] );
+        }
+
+        $filename_raw = isset( $_POST['filename'] ) ? sanitize_file_name( wp_unslash( $_POST['filename'] ) ) : '';
+         if ( empty( $filename_raw ) || ! preg_match( '/^backup_.*\.tar\.gz$/', $filename_raw ) ) {
+             wp_send_json_error( [ 'message' => esc_html__( 'Invalid backup filename provided.', 'webp-optimizer' ) ] );
+        }
+
+        $backup_path = trailingslashit( SH_WEBP_BACKUP_DIR ) . $filename_raw;
+
+        // Verify the file exists and is within the backup directory before deleting
+        if ( file_exists( $backup_path ) && strpos( realpath( $backup_path ), realpath( SH_WEBP_BACKUP_DIR ) ) === 0 ) {
+            if ( wp_delete_file( $backup_path ) ) {
+                 wp_send_json_success( [ 'message' => esc_html__( 'Backup file deleted.', 'webp-optimizer' ) ] );
+            } else {
+                 wp_send_json_error( [ 'message' => esc_html__( 'Could not delete the file. Check permissions.', 'webp-optimizer' ) ] );
+            }
+        } else {
+             wp_send_json_error( [ 'message' => esc_html__( 'Backup file not found or invalid path.', 'webp-optimizer' ) ] );
+        }
+    }
+
+     /**
+     * Handle backup file download request via admin-post.
+     */
+    public function handle_download_backup() {
+        if ( ! isset( $_GET['_wpnonce'] ) || ! wp_verify_nonce( sanitize_key( $_GET['_wpnonce'] ), 'sh_webp_download_nonce' ) ) {
+            wp_die( esc_html__( 'Nonce verification failed.', 'webp-optimizer' ) );
+        }
+         if ( ! current_user_can( 'manage_options' ) ) {
+            wp_die( esc_html__( 'Permission denied.', 'webp-optimizer' ) );
+        }
+
+        $filename_raw = isset( $_GET['filename'] ) ? sanitize_file_name( wp_unslash( $_GET['filename'] ) ) : '';
+         if ( empty( $filename_raw ) || ! preg_match( '/^backup_.*\.tar\.gz$/', $filename_raw ) ) {
+             wp_die( esc_html__( 'Invalid backup filename provided.', 'webp-optimizer' ) );
+        }
+
+        $backup_path = trailingslashit( SH_WEBP_BACKUP_DIR ) . $filename_raw;
+
+        // Verify the file exists and is within the backup directory
+        if ( file_exists( $backup_path ) && is_readable( $backup_path ) && strpos( realpath( $backup_path ), realpath( SH_WEBP_BACKUP_DIR ) ) === 0 ) {
+            
+            header( 'Content-Description: File Transfer' );
+            header( 'Content-Type: application/gzip' );
+            header( 'Content-Disposition: attachment; filename="' . $filename_raw . '"' );
+            header( 'Expires: 0' );
+            header( 'Cache-Control: must-revalidate' );
+            header( 'Pragma: public' );
+            header( 'Content-Length: ' . filesize( $backup_path ) );
+            
+            // Prevent WordPress from adding extra output
+            @ob_end_clean(); 
+            flush(); // Flush system output buffer
+            
+            // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_read_readfile
+            readfile( $backup_path );
+            exit;
+
+        } else {
+            wp_die( esc_html__( 'Backup file not found, is not readable, or invalid path.', 'webp-optimizer' ) );
+        }
+    }
+
+
+    //======================================================================
+    // 4. STATS & INFO HELPERS
+    //======================================================================
+
+    /**
+     * Get image counts (cached).
+     */
+    // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    private function get_image_stats() {
+        $stats = get_transient( $this->stats_transient );
+        if ( false === $stats ) {
+            global $wpdb;
+            $stats = [ 'total' => 0, 'webp' => 0, 'png' => 0, 'jpeg' => 0 ];
+
+            $counts = $wpdb->get_results(
+                "SELECT post_mime_type, COUNT(*) as count 
+                 FROM {$wpdb->posts} 
+                 WHERE post_type = 'attachment' 
+                 AND post_mime_type IN ('image/jpeg', 'image/png', 'image/webp')
+                 GROUP BY post_mime_type"
+            );
+
+            if ( $counts ) {
+                foreach ( $counts as $row ) {
+                    if ( $row->post_mime_type === 'image/webp' ) $stats['webp'] = (int) $row->count;
+                    if ( $row->post_mime_type === 'image/png' ) $stats['png'] = (int) $row->count;
+                    if ( $row->post_mime_type === 'image/jpeg' ) $stats['jpeg'] = (int) $row->count;
+                }
+                $stats['total'] = $stats['webp'] + $stats['png'] + $stats['jpeg'];
+            }
+            set_transient( $this->stats_transient, $stats, HOUR_IN_SECONDS ); // Cache for 1 hour
+        }
+        return $stats;
+    }
+    // phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+    /**
+     * Get various server information points.
+     */
+    private function get_server_info() {
+        return [
+            'server_type'  => isset( $_SERVER['SERVER_SOFTWARE'] ) ? sanitize_text_field( wp_unslash( $_SERVER['SERVER_SOFTWARE'] ) ) : 'N/A',
+            'db_size'      => $this->get_db_size(),
+            'storage'      => size_format( $this->get_directory_size( ABSPATH ), 2 ), // Show WP install size
+            'plugin_count' => $this->get_plugin_count(),
+            'wp_version'   => $this->get_wp_version_info(),
+            'php_version'  => $this->get_php_version_info(),
+        ];
+    }
+
+    /**
+     * Get Database size (cached).
+     */
+    // phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    private function get_db_size() {
+        $size = get_transient( $this->db_size_transient );
+        if ( false === $size ) {
+            global $wpdb;
+            // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+            $size = $wpdb->get_var(
+                $wpdb->prepare(
+                    "SELECT SUM(data_length + index_length) 
+                     FROM information_schema.TABLES 
+                     WHERE table_schema = %s",
+                    DB_NAME
+                )
+            );
+            set_transient( $this->db_size_transient, $size, HOUR_IN_SECONDS ); // Cache for 1 hour
+        }
+        return size_format( (int) $size, 2 );
+    }
+    // phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+    
+     /**
+     * Calculate the size of a directory recursively.
+     * @param string $directory Path to the directory.
+     * @return int Size in bytes.
+     */
+    private function get_directory_size( $directory ) {
+        $size = 0;
+        try {
+            $iterator = new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $directory, \FilesystemIterator::SKIP_DOTS | \FilesystemIterator::UNIX_PATHS ) );
+            foreach ( $iterator as $file ) {
+                if ($file->isFile()) {
+                     $size += $file->getSize();
+                }
+            }
+        } catch (\Exception $e) {
+            // Could fail due to permissions or open_basedir restrictions
+            return 0; // Return 0 if size calculation fails
+        }
+        return $size;
+    }
+
+
+    /** Get Active/Total Plugin Count */
+    private function get_plugin_count() {
+        if ( ! function_exists( 'get_plugins' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        $all_plugins = get_plugins();
+        $active_plugins = get_option( 'active_plugins', [] );
+        // Consider multisite active plugins if applicable
+        if ( is_multisite() ) {
+            $network_plugins = get_site_option( 'active_sitewide_plugins', [] );
+            if ( $network_plugins ) {
+                $active_plugins = array_merge( $active_plugins, array_keys( $network_plugins ) );
+            }
+        }
+        return count( array_unique( $active_plugins ) ) . ' / ' . count( $all_plugins );
+    }
+
+    /** Get WP Version & Update Status */
+    private function get_wp_version_info() {
+        global $wp_version;
+        $core_updates = get_core_updates();
+        $update_available = false;
+        if ( ! empty( $core_updates ) && is_array( $core_updates ) ) {
+             foreach ($core_updates as $update) {
+                 if ( isset($update->response) && $update->response === 'upgrade' ) {
+                      $update_available = true;
+                      break;
+                 }
+             }
+        }
+
+        if ( $update_available ) {
+            return $wp_version . ' <strong style="color: #d63638;">(' . esc_html__( 'Update Available', 'webp-optimizer' ) . ')</strong>';
+        }
+        return $wp_version . ' <span style="color: #228b22;">(' . esc_html__( 'Up to date', 'webp-optimizer' ) . ')</span>';
+    }
+
+    /** Get PHP Version & Recommendation */
+    private function get_php_version_info() {
+        $php_version = PHP_VERSION;
+        $recommended = '8.0'; // Update as recommendations change
+        if ( version_compare( $php_version, $recommended, '<' ) ) {
+            /* translators: %s: Recommended PHP version number. */
+            return $php_version . ' <strong style="color: #ffb900;">(' . sprintf( esc_html__( 'Recommended: %s+', 'webp-optimizer' ), $recommended ) . ')</strong>';
+        }
+        return $php_version . ' <span style="color: #228b22;">(' . esc_html__( 'Good', 'webp-optimizer' ) . ')</span>';
+    }
+    
+    /**
+     * Get a list of backup files.
+     * @return array List of backup files with details.
+     */
+    private function get_backup_files() {
+        $files = [];
+        if ( ! file_exists( SH_WEBP_BACKUP_DIR ) ) {
+            return $files; // Return empty if directory doesn't exist
+        }
+
+        $items = @scandir( SH_WEBP_BACKUP_DIR );
+        if ( ! $items ) return $files; // Return empty if scandir fails
+
+        foreach ( $items as $item ) {
+            // Match files starting with 'backup_' and ending with '.tar.gz'
+            if ( preg_match( '/^backup_.*\.tar\.gz$/', $item ) ) {
+                $filepath = trailingslashit( SH_WEBP_BACKUP_DIR ) . $item;
+                $files[] = [
+                    'name' => $item,
+                    'size' => @filesize( $filepath ),
+                    'modified' => @filemtime( $filepath ),
+                ];
+            }
+        }
+        // Sort files by modified date, newest first
+        usort( $files, function( $a, $b ) {
+            return $b['modified'] <=> $a['modified'];
+        });
+        return $files;
+    }
+
+
+    //======================================================================
+    // 5. SECURITY
+    //======================================================================
+    
+    /**
+     * Initialize security settings like disabling XML-RPC based on options.
+     */
+    public function init_security_settings() {
+        $xmlrpc_setting = get_option( $this->xmlrpc_option, 'enabled' ); // Default to enabled
+        if ( $xmlrpc_setting === 'disabled' ) {
+            add_filter( 'xmlrpc_enabled', '__return_false' ); // Disable XML-RPC
+            // Optionally remove RSD link from header
+            remove_action( 'wp_head', 'rsd_link' );
+        }
+    }
+
+
+} // End Class Shehab_WebP_Converter
+
+// --- Initialize the plugin ---
+// Ensures the class is loaded and hooks are registered.
+Shehab_WebP_Converter::instance();
+
